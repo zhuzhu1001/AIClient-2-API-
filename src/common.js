@@ -220,19 +220,48 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let fullResponseJson = '';
     let fullOldResponseJson = '';
     let responseClosed = false;
+    let headersSent = false;
 
-    await handleUnifiedResponse(res, '', true);
+    // 延迟发送 header，等到第一个数据块到达或确认流正常开始后再发送
+    // 这样如果 generateContentStream 抛出错误，可以返回正确的 HTTP 状态码
+    const sendHeadersIfNeeded = () => {
+        if (!headersSent && !res.headersSent) {
+            res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked"
+            });
+            headersSent = true;
+        }
+    };
 
     // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
     // The service returns a stream in its native format (toProvider).
     const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
     requestBody.model = model;
-    const nativeStream = await service.generateContentStream(model, requestBody);
+
+    let nativeStream;
+    try {
+        nativeStream = await service.generateContentStream(model, requestBody);
+    } catch (error) {
+        // 流创建失败，此时 header 还未发送，可以返回正确的 HTTP 状态码
+        console.error('\n[Server] Error creating stream:', error.stack);
+        if (providerPoolManager && pooluuid) {
+            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to stream creation error`);
+            providerPoolManager.markProviderUnhealthy(toProvider, { uuid: pooluuid }, error.message);
+        }
+        await handleErrorResponse(res, error, fromProvider, false);
+        return;
+    }
+
     const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
     const openStop = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI ;
 
     try {
         for await (const nativeChunk of nativeStream) {
+            // 收到第一个数据块时发送 header
+            sendHeadersIfNeeded();
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
             if (chunkText && !Array.isArray(chunkText)) {
@@ -286,9 +315,18 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
             providerPoolManager.markProviderUnhealthy(toProvider, {
                 uuid: pooluuid
-            });
+            }, error.message);
         }
 
+        // 流式请求：如果 header 还没发送，设置正确的 HTTP 状态码
+        if (!res.headersSent) {
+            const statusCode = extractHttpStatusCode(error);
+            res.writeHead(statusCode, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            });
+        }
         // 使用新方法创建符合 fromProvider 格式的流式错误响应
         const errorPayload = createStreamErrorResponse(error, fromProvider);
         res.write(errorPayload);
@@ -337,16 +375,15 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
     } catch (error) {
         console.error('\n[Server] Error during unary processing:', error.stack);
         if (providerPoolManager && pooluuid) {
-            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to stream error`);
+            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to unary error`);
             // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
             providerPoolManager.markProviderUnhealthy(toProvider, {
                 uuid: pooluuid
-            });
+            }, error.message);
         }
 
-        // 使用新方法创建符合 fromProvider 格式的错误响应
-        const errorResponse = createErrorResponse(error, fromProvider);
-        await handleUnifiedResponse(res, JSON.stringify(errorResponse), false);
+        // 使用新方法返回正确的 HTTP 状态码
+        await handleErrorResponse(res, error, fromProvider, false);
     }
 }
 
@@ -360,15 +397,16 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
  * @param {Object} CONFIG - The server configuration object.
  */
 export async function handleModelListRequest(req, res, service, endpointType, CONFIG, providerPoolManager, pooluuid) {
+    // toProvider 需要在 try 外定义，catch 中也要用
+    const toProvider = CONFIG.MODEL_PROVIDER;
+
     try{
         const clientProviderMap = {
             [ENDPOINT_TYPE.OPENAI_MODEL_LIST]: MODEL_PROTOCOL_PREFIX.OPENAI,
             [ENDPOINT_TYPE.GEMINI_MODEL_LIST]: MODEL_PROTOCOL_PREFIX.GEMINI,
         };
 
-
         const fromProvider = clientProviderMap[endpointType];
-        const toProvider = CONFIG.MODEL_PROVIDER;
 
         if (!fromProvider) {
             throw new Error(`Unsupported endpoint type for model list: ${endpointType}`);
@@ -391,12 +429,23 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
         res.end(JSON.stringify(clientModelList));
     } catch (error) {
         console.error('\n[Server] Error during model list processing:', error.stack);
-        if (providerPoolManager) {
+        if (providerPoolManager && pooluuid) {
             // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
             providerPoolManager.markProviderUnhealthy(toProvider, {
                 uuid: pooluuid
-            });
+            }, error.message);
         }
+        // 返回正确的 HTTP 状态码
+        const statusCode = extractHttpStatusCode(error);
+        if (!res.headersSent) {
+            res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify({
+            error: {
+                message: error.message || 'Failed to fetch model list',
+                code: statusCode
+            }
+        }));
     }
 }
 
@@ -526,7 +575,7 @@ export function extractPromptText(requestBody, provider) {
 }
 
 export function handleError(res, error, provider = null) {
-    const statusCode = error.response?.status || error.statusCode || error.status || error.code || 500;
+    const statusCode = extractHttpStatusCode(error);
     let errorMessage = error.message;
     let suggestions = [];
 
@@ -827,6 +876,32 @@ export function getMD5Hash(obj) {
     return crypto.createHash('md5').update(jsonString).digest('hex');
 }
 
+/**
+ * 从 error 对象中提取有效的 HTTP 状态码
+ * 确保返回的是有效的数字状态码 (100-599)，否则回退到 500
+ * @param {Error} error - 错误对象
+ * @returns {number} 有效的 HTTP 状态码
+ */
+export function extractHttpStatusCode(error) {
+    // 按优先级检查各种可能的状态码来源
+    const candidates = [
+        error.response?.status,     // Axios 响应状态码
+        error.statusCode,           // 自定义 statusCode
+        error.status,               // 标准 status
+    ];
+
+    for (const candidate of candidates) {
+        // 确保是数字且在有效范围内 (100-599)
+        if (typeof candidate === 'number' && candidate >= 100 && candidate <= 599) {
+            return candidate;
+        }
+    }
+
+    // error.code 可能是字符串如 'ECONNRESET'，不能用于 HTTP 状态码
+    // 回退到 500
+    return 500;
+}
+
 
 /**
  * 创建符合 fromProvider 格式的错误响应（非流式）
@@ -836,7 +911,7 @@ export function getMD5Hash(obj) {
  */
 function createErrorResponse(error, fromProvider) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
-    const statusCode = error.status || error.code || 500;
+    const statusCode = extractHttpStatusCode(error);
     const errorMessage = error.message || "An error occurred during processing.";
     
     // 根据 HTTP 状态码映射错误类型
@@ -920,7 +995,7 @@ function createErrorResponse(error, fromProvider) {
  */
 function createStreamErrorResponse(error, fromProvider) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
-    const statusCode = error.status || error.code || 500;
+    const statusCode = extractHttpStatusCode(error);
     const errorMessage = error.message || "An error occurred during streaming.";
     
     // 根据 HTTP 状态码映射错误类型
@@ -1003,5 +1078,38 @@ function createStreamErrorResponse(error, fromProvider) {
                 }
             };
             return `data: ${JSON.stringify(defaultError)}\n\n`;
+    }
+}
+
+/**
+ * 处理错误响应，返回正确的 HTTP 状态码
+ * @param {http.ServerResponse} res - HTTP 响应对象
+ * @param {Error} error - 错误对象
+ * @param {string} fromProvider - 客户端期望的提供商格式
+ * @param {boolean} isStream - 是否是流式请求
+ */
+export async function handleErrorResponse(res, error, fromProvider, isStream = false) {
+    // 从 error 对象提取正确的状态码（确保是有效的数字状态码）
+    const statusCode = extractHttpStatusCode(error);
+
+    if (isStream) {
+        // 流式错误响应
+        if (!res.headersSent) {
+            res.writeHead(statusCode, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            });
+        }
+        const errorPayload = createStreamErrorResponse(error, fromProvider);
+        res.write(errorPayload);
+        res.end();
+    } else {
+        // 非流式错误响应
+        const errorResponse = createErrorResponse(error, fromProvider);
+        if (!res.headersSent) {
+            res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        }
+        res.end(JSON.stringify(errorResponse));
     }
 }

@@ -152,16 +152,18 @@ export class ProviderPoolManager {
             return null;
         }
 
-        // 改进：使用“最久未被使用”策略（LRU）代替取模轮询
-        // 这样即使可用列表长度动态变化，也能确保每个账号被平均轮到
-        const selected = availableAndHealthyProviders.sort((a, b) => {
-            const timeA = a.config.lastUsed ? new Date(a.config.lastUsed).getTime() : 0;
-            const timeB = b.config.lastUsed ? new Date(b.config.lastUsed).getTime() : 0;
-            // 优先选择从未用过的，或者最久没用的
-            if (timeA !== timeB) return timeA - timeB;
-            // 如果时间相同，使用使用次数辅助判断
-            return (a.config.usageCount || 0) - (b.config.usageCount || 0);
-        })[0];
+        // 使用 Round Robin 策略，确保并发请求均匀分配到不同账户
+        // JavaScript 单线程特性保证了计数器操作的原子性
+        if (this.roundRobinIndex[providerType] === undefined) {
+            this.roundRobinIndex[providerType] = 0;
+        }
+
+        // 获取当前索引并递增（取模确保不越界）
+        const currentIndex = this.roundRobinIndex[providerType] % availableAndHealthyProviders.length;
+        this.roundRobinIndex[providerType] = (this.roundRobinIndex[providerType] + 1) % Number.MAX_SAFE_INTEGER;
+
+        const selected = availableAndHealthyProviders[currentIndex];
+        this._log('debug', `Round Robin: providerType=${providerType}, index=${currentIndex}/${availableAndHealthyProviders.length}, selected=${selected.config.uuid}`);
         
         // 更新使用信息（除非明确跳过）
         if (!options.skipUsageCount) {
