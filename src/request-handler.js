@@ -166,10 +166,10 @@ export function createRequestHandler(config, providerPoolManager) {
         } catch (error) {
             handleError(res, { statusCode: 500, message: `Failed to get API service: ${error.message}` }, currentConfig.MODEL_PROVIDER);
             const poolManager = getProviderPoolManager();
-            if (poolManager) {
+            if (poolManager && currentConfig.uuid) {
                 poolManager.markProviderUnhealthy(currentConfig.MODEL_PROVIDER, {
                     uuid: currentConfig.uuid
-                });
+                }, error.message);
             }
             return;
         }
