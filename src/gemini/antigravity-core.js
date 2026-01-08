@@ -44,6 +44,8 @@ const OAUTH_CLIENT_SECRET = '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';
 const DEFAULT_USER_AGENT = 'antigravity/1.104.0 darwin/arm64';
 const REFRESH_SKEW = 3000; // 3000秒（50分钟）提前刷新Token
 
+const ANTIGRAVITY_SYSTEM_PROMPT = `You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**`;
+
 // Thinking 配置相关常量
 const DEFAULT_THINKING_MIN = 1024;
 const DEFAULT_THINKING_MAX = 100000;
@@ -264,6 +266,7 @@ function geminiToAntigravity(modelName, payload, projectId) {
     // 设置基本字段
     template.model = modelName;
     template.userAgent = 'antigravity';
+    template.requestType = 'agent';
     template.project = projectId || generateProjectID();
     template.requestId = generateRequestID();
 
@@ -620,16 +623,63 @@ function toGeminiApiResponse(antigravityResponse) {
  * @param {Object} requestBody - 请求体
  * @returns {Object} 处理后的请求体
  */
-function ensureRolesInContents(requestBody) {
+function ensureRolesInContents(requestBody, modelName) {
     delete requestBody.model;
-
+    // delete requestBody.system_instruction;
+    // delete requestBody.systemInstruction;
     if (requestBody.system_instruction) {
         requestBody.systemInstruction = requestBody.system_instruction;
         delete requestBody.system_instruction;
     }
 
-    if (requestBody.systemInstruction && !requestBody.systemInstruction.role) {
-        requestBody.systemInstruction.role = 'user';
+    // 提取现有的系统提示词
+    let originalSystemPrompt = requestBody.systemInstruction;
+    
+    // 如果 systemInstruction 是对象格式，提取其中的文本内容
+    let originalSystemPromptText = '';
+    if (originalSystemPrompt) {
+        if (typeof originalSystemPrompt === 'string') {
+            originalSystemPromptText = originalSystemPrompt;
+        } else if (typeof originalSystemPrompt === 'object') {
+            // 处理对象格式的 systemInstruction
+            if (originalSystemPrompt.parts && Array.isArray(originalSystemPrompt.parts)) {
+                // 从 parts 数组中提取所有文本
+                originalSystemPromptText = originalSystemPrompt.parts
+                    .map(part => {
+                        if (typeof part === 'string') return part;
+                        if (part && typeof part.text === 'string') return part.text;
+                        return '';
+                    })
+                    .filter(text => text)
+                    .join('\n');
+            } else if (originalSystemPrompt.text) {
+                // 直接有 text 属性
+                originalSystemPromptText = originalSystemPrompt.text;
+            }
+        }
+    }
+    
+    const name = modelName ? modelName.toLowerCase() : '';
+    const useAntigravity = name.includes('gemini-3-pro') || name.includes('claude');
+
+    if (useAntigravity) {
+        const finalPrompt = originalSystemPromptText
+            ? `${ANTIGRAVITY_SYSTEM_PROMPT}\n\n${originalSystemPromptText}`
+            : ANTIGRAVITY_SYSTEM_PROMPT;
+        
+        requestBody.systemInstruction = {
+            role: 'user',
+            parts: [{ text: finalPrompt }]
+        };
+    } else if (originalSystemPromptText) {
+        // 对于其他模型，如果有原始系统提示词，保留它
+        requestBody.systemInstruction = {
+            role: 'user',
+            parts: [{ text: originalSystemPromptText }]
+        };
+    } else {
+        // 没有有效的系统提示词，删除该字段
+        delete requestBody.systemInstruction;
     }
 
     if (requestBody.contents && Array.isArray(requestBody.contents)) {
@@ -693,8 +743,8 @@ export class AntigravityApiService {
         
         // 默认降级顺序：daily -> sandbox -> prod
         return [
-            ANTIGRAVITY_BASE_URL_DAILY,
             ANTIGRAVITY_SANDBOX_BASE_URL_DAILY,
+            ANTIGRAVITY_BASE_URL_DAILY,
             ANTIGRAVITY_BASE_URL_PROD
         ];
     }
@@ -1179,9 +1229,9 @@ export class AntigravityApiService {
             selectedModel = this.availableModels[0];
         }
 
-        // 深拷贝请求体
-        const processedRequestBody = ensureRolesInContents(JSON.parse(JSON.stringify(requestBody)));
         const actualModelName = alias2ModelName(selectedModel);
+        // 深拷贝请求体
+        const processedRequestBody = ensureRolesInContents(JSON.parse(JSON.stringify(requestBody)), actualModelName);
         const isClaudeModel = isClaude(actualModelName);
 
         // 将处理后的请求体转换为 Antigravity 格式
@@ -1235,9 +1285,9 @@ export class AntigravityApiService {
             selectedModel = this.availableModels[0];
         }
 
-        // 深拷贝请求体
-        const processedRequestBody = ensureRolesInContents(JSON.parse(JSON.stringify(requestBody)));
         const actualModelName = alias2ModelName(selectedModel);
+        // 深拷贝请求体
+        const processedRequestBody = ensureRolesInContents(JSON.parse(JSON.stringify(requestBody)), actualModelName);
 
         // 将处理后的请求体转换为 Antigravity 格式
         const payload = geminiToAntigravity(actualModelName, { request: processedRequestBody }, this.projectId);
