@@ -31,13 +31,68 @@ export const RETRYABLE_NETWORK_ERRORS = [
  */
 export function isRetryableNetworkError(error) {
     if (!error) return false;
-    
+
     const errorCode = error.code || '';
     const errorMessage = error.message || '';
-    
+
     return RETRYABLE_NETWORK_ERRORS.some(errId =>
         errorCode === errId || errorMessage.includes(errId)
     );
+}
+
+/**
+ * 识别需要立即标记不健康并换账户重试的错误
+ * 包括：429 Rate Limit、额度耗尽、容量不足
+ * @param {Error} error - 错误对象
+ * @returns {boolean} - 是否为需要换账户重试的错误
+ */
+export function isCapacityExhaustedError(error) {
+    if (!error) return false;
+
+    const message = (error.message || '').toLowerCase();
+    const statusCode = extractHttpStatusCode(error);
+
+    // HTTP 429 Rate Limit
+    if (statusCode === 429) {
+        return true;
+    }
+
+    // 额度耗尽相关消息
+    const exhaustedPatterns = [
+        'exhausted your capacity',
+        'no capacity available',
+        'quota exceeded',
+        'rate limit exceeded',
+        'too many requests',
+        'resource exhausted',
+        'rate_limit_error'
+    ];
+
+    return exhaustedPatterns.some(pattern => message.includes(pattern));
+}
+
+/**
+ * 识别不可重试的错误（如空请求体、无效请求）
+ * 这些错误不应该重试，直接返回给客户端
+ * @param {Error} error - 错误对象
+ * @returns {boolean} - 是否为不可重试的错误
+ */
+export function isNonRetryableError(error) {
+    if (!error) return false;
+
+    const message = (error.message || '').toLowerCase();
+
+    const nonRetryablePatterns = [
+        'contents field is required',
+        'request body is missing',
+        'invalid json',
+        'invalid request',
+        'invalid_request_error',
+        'authentication_error',
+        'permission_denied'
+    ];
+
+    return nonRetryablePatterns.some(pattern => message.includes(pattern));
 }
 
 // ==================== API 常量 ====================
@@ -241,19 +296,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
     requestBody.model = model;
 
-    let nativeStream;
-    try {
-        nativeStream = await service.generateContentStream(model, requestBody);
-    } catch (error) {
-        // 流创建失败，此时 header 还未发送，可以返回正确的 HTTP 状态码
-        console.error('\n[Server] Error creating stream:', error.stack);
-        if (providerPoolManager && pooluuid) {
-            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to stream creation error`);
-            providerPoolManager.markProviderUnhealthy(toProvider, { uuid: pooluuid }, error.message);
-        }
-        await handleErrorResponse(res, error, fromProvider, false);
-        return;
-    }
+    // 流创建阶段：如果失败，向上抛出异常以支持重试机制
+    // 此时 header 还未发送，上层可以捕获异常并尝试换账户重试
+    const nativeStream = await service.generateContentStream(model, requestBody);
 
     const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
     const openStop = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI ;
@@ -294,6 +339,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // console.log(`data: ${JSON.stringify(chunk)}\n`);
             }
         }
+        // 确保在发送结束标记前 header 已发送（处理零 chunk 场景）
+        sendHeadersIfNeeded();
+
         if (openStop && needsConversion) {
             res.write(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n\n`);
             // console.log(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n`);
@@ -344,46 +392,33 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
 
 export async function handleUnaryRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName) {
-    try{
-        // The service returns the response in its native format (toProvider).
-        const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
-        requestBody.model = model;
-        // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
-        const nativeResponse = await service.generateContent(model, requestBody);
-        const responseText = extractResponseText(nativeResponse, toProvider);
+    // 移除 try-catch，让错误向上传播以支持重试机制
+    // The service returns the response in its native format (toProvider).
+    const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
+    requestBody.model = model;
+    // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
+    const nativeResponse = await service.generateContent(model, requestBody);
+    const responseText = extractResponseText(nativeResponse, toProvider);
 
-        // Convert the response back to the client's format (fromProvider), if necessary.
-        let clientResponse = nativeResponse;
-        if (needsConversion) {
-            console.log(`[Response Convert] Converting response from ${toProvider} to ${fromProvider}`);
-            clientResponse = convertData(nativeResponse, 'response', toProvider, fromProvider, model);
-        }
+    // Convert the response back to the client's format (fromProvider), if necessary.
+    let clientResponse = nativeResponse;
+    if (needsConversion) {
+        console.log(`[Response Convert] Converting response from ${toProvider} to ${fromProvider}`);
+        clientResponse = convertData(nativeResponse, 'response', toProvider, fromProvider, model);
+    }
 
-        //console.log(`[Response] Sending response to client: ${JSON.stringify(clientResponse)}`);
-        await handleUnifiedResponse(res, JSON.stringify(clientResponse), false);
-        await logConversation('output', responseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
-        // fs.writeFile('oldResponse'+Date.now()+'.json', JSON.stringify(clientResponse));
-        
-        // 一元请求成功完成，统计使用次数，错误次数重置为0
-        if (providerPoolManager && pooluuid) {
-            const customNameDisplay = customName ? `, ${customName}` : '';
-            console.log(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful unary request`);
-            providerPoolManager.markProviderHealthy(toProvider, {
-                uuid: pooluuid
-            });
-        }
-    } catch (error) {
-        console.error('\n[Server] Error during unary processing:', error.stack);
-        if (providerPoolManager && pooluuid) {
-            console.log(`[Provider Pool] Marking ${toProvider} as unhealthy due to unary error`);
-            // 如果是号池模式，并且请求处理失败，则标记当前使用的提供者为不健康
-            providerPoolManager.markProviderUnhealthy(toProvider, {
-                uuid: pooluuid
-            }, error.message);
-        }
+    //console.log(`[Response] Sending response to client: ${JSON.stringify(clientResponse)}`);
+    await handleUnifiedResponse(res, JSON.stringify(clientResponse), false);
+    await logConversation('output', responseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+    // fs.writeFile('oldResponse'+Date.now()+'.json', JSON.stringify(clientResponse));
 
-        // 使用新方法返回正确的 HTTP 状态码
-        await handleErrorResponse(res, error, fromProvider, false);
+    // 一元请求成功完成，统计使用次数，错误次数重置为0
+    if (providerPoolManager && pooluuid) {
+        const customNameDisplay = customName ? `, ${customName}` : '';
+        console.log(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful unary request`);
+        providerPoolManager.markProviderHealthy(toProvider, {
+            uuid: pooluuid
+        });
     }
 }
 
@@ -435,17 +470,13 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
                 uuid: pooluuid
             }, error.message);
         }
-        // 返回正确的 HTTP 状态码
-        const statusCode = extractHttpStatusCode(error);
-        if (!res.headersSent) {
-            res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-        }
-        res.end(JSON.stringify({
-            error: {
-                message: error.message || 'Failed to fetch model list',
-                code: statusCode
-            }
-        }));
+        // 使用 handleErrorResponse 返回协议一致的错误响应
+        const clientProviderMap = {
+            [ENDPOINT_TYPE.OPENAI_MODEL_LIST]: MODEL_PROTOCOL_PREFIX.OPENAI,
+            [ENDPOINT_TYPE.GEMINI_MODEL_LIST]: MODEL_PROTOCOL_PREFIX.GEMINI,
+        };
+        const fromProvider = clientProviderMap[endpointType] || MODEL_PROTOCOL_PREFIX.OPENAI;
+        await handleErrorResponse(res, error, fromProvider, false);
     }
 }
 
@@ -460,10 +491,9 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
  * @param {string} PROMPT_LOG_FILENAME - The prompt log filename.
  */
 export async function handleContentGenerationRequest(req, res, service, endpointType, CONFIG, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid) {
+    const MAX_RETRY_COUNT = 3; // 最大重试次数（换账户重试）
+
     const originalRequestBody = await getRequestBody(req);
-    if (!originalRequestBody) {
-        throw new Error("Request body is missing for content generation.");
-    }
 
     const clientProviderMap = {
         [ENDPOINT_TYPE.OPENAI_CHAT]: MODEL_PROTOCOL_PREFIX.OPENAI,
@@ -473,13 +503,35 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     };
 
     const fromProvider = clientProviderMap[endpointType];
-    // 使用实际的提供商类型（可能是 fallback 后的类型）
-    let toProvider = CONFIG.actualProviderType || CONFIG.MODEL_PROVIDER;
-    let actualUuid = pooluuid;
-    
+
     if (!fromProvider) {
         throw new Error(`Unsupported endpoint type for content generation: ${endpointType}`);
     }
+
+    // ========== 请求体有效性检查（不可重试错误，直接返回） ==========
+    // 检查 originalRequestBody 是否为合法对象
+    if (!originalRequestBody || typeof originalRequestBody !== 'object') {
+        const error = new Error('Unable to submit request because at least one contents field is required.');
+        error.statusCode = 400;
+        await handleErrorResponse(res, error, fromProvider, false);
+        return;
+    }
+
+    // 检查是否包含必要的内容字段
+    const hasContents = originalRequestBody.contents?.length > 0;
+    const hasMessages = originalRequestBody.messages?.length > 0;
+    const hasInput = originalRequestBody.input?.length > 0;
+
+    if (!hasContents && !hasMessages && !hasInput) {
+        const error = new Error('Unable to submit request because at least one contents field is required.');
+        error.statusCode = 400;
+        await handleErrorResponse(res, error, fromProvider, false);
+        return;
+    }
+
+    // 使用实际的提供商类型（可能是 fallback 后的类型）
+    let toProvider = CONFIG.actualProviderType || CONFIG.MODEL_PROVIDER;
+    let actualUuid = pooluuid;
 
     // 2. Extract model and determine if the request is for streaming.
     let { model, isStream } = _extractModelAndStreamInfo(req, originalRequestBody, fromProvider);
@@ -490,18 +542,19 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     console.log(`[Content Generation] Model: ${model}, Stream: ${isStream}`);
 
     let actualCustomName = CONFIG.customName;
+    let currentService = service;
 
-    // 2.5. 如果使用了提供商池，根据模型重新选择提供商（支持 Fallback）
-    // 注意：这里使用 skipUsageCount: true，因为初次选择时已经增加了 usageCount
+    // 2.5. 始终使用 getApiServiceWithFallback 选择支持该模型的账号
+    // 这确保了模型级筛选和 fallback 链的正确工作
     if (providerPoolManager && CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]) {
         const { getApiServiceWithFallback } = await import('./service-manager.js');
         const result = await getApiServiceWithFallback(CONFIG, model);
-        
-        service = result.service;
+
+        currentService = result.service;
         toProvider = result.actualProviderType;
         actualUuid = result.uuid || pooluuid;
         actualCustomName = result.serviceConfig?.customName || CONFIG.customName;
-        
+
         // 如果发生了模型级别的 fallback，需要更新请求使用的模型
         if (result.actualModel && result.actualModel !== model) {
             console.log(`[Content Generation] Model Fallback: ${model} -> ${result.actualModel}`);
@@ -511,34 +564,119 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         if (result.isFallback) {
             console.log(`[Content Generation] Fallback activated: ${CONFIG.MODEL_PROVIDER} -> ${toProvider} (uuid: ${actualUuid})`);
         } else {
-            console.log(`[Content Generation] Re-selected service adapter based on model: ${model}`);
+            console.log(`[Content Generation] Selected provider for model ${model}: ${toProvider} (uuid: ${actualUuid})`);
         }
     }
 
-    // 1. Convert request body from client format to backend format, if necessary.
-    let processedRequestBody = originalRequestBody;
-    // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));
-    if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
-        console.log(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
-        processedRequestBody = convertData(originalRequestBody, 'request', fromProvider, toProvider);
-    } else {
-        console.log(`[Request Convert] Request format matches backend provider. No conversion needed.`);
+    // ========== 带重试的请求处理 ==========
+    let retryCount = 0;
+    let lastError = null;
+
+    while (retryCount < MAX_RETRY_COUNT) {
+        try {
+            // 1. 深拷贝原始请求体，避免 _applySystemPromptFromFile/_manageSystemPrompt 重复修改
+            // 使用 structuredClone 保留 Uint8Array、Date 等非 JSON 类型（支持多模态输入）
+            let processedRequestBody = structuredClone(originalRequestBody);
+
+            // 2. Convert request body from client format to backend format, if necessary.
+            if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
+                console.log(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
+                processedRequestBody = convertData(processedRequestBody, 'request', fromProvider, toProvider);
+            } else {
+                console.log(`[Request Convert] Request format matches backend provider. No conversion needed.`);
+            }
+
+            // 3. Apply system prompt from file if configured.
+            processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
+            await _manageSystemPrompt(processedRequestBody, toProvider);
+
+            // 4. Log the incoming prompt (after potential conversion to the backend's format).
+            const promptText = extractPromptText(processedRequestBody, toProvider);
+            await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+
+            // 5. Call the appropriate stream or unary handler, passing the provider info.
+            if (isStream) {
+                await handleStreamRequest(res, currentService, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
+            } else {
+                await handleUnaryRequest(res, currentService, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
+            }
+
+            // 请求成功，直接返回
+            return;
+
+        } catch (error) {
+            lastError = error;
+
+            // 检查是否为不可重试错误（如无效请求、认证错误等）
+            if (isNonRetryableError(error)) {
+                console.log(`[Retry] Non-retryable error, returning immediately: ${error.message}`);
+                // 不可重试错误也需要标记账号不健康（如 401/403 认证错误）
+                if (providerPoolManager && actualUuid) {
+                    providerPoolManager.markProviderUnhealthy(toProvider, { uuid: actualUuid }, error.message);
+                }
+                await handleErrorResponse(res, error, fromProvider, isStream);
+                return;
+            }
+
+            // 检查是否为需要换账户重试的错误（429、额度耗尽等）
+            if (isCapacityExhaustedError(error) && providerPoolManager) {
+                retryCount++;
+                console.log(`[Retry] Capacity exhausted error detected, attempt ${retryCount}/${MAX_RETRY_COUNT}: ${error.message}`);
+
+                // 立即标记当前账户为不健康
+                if (actualUuid) {
+                    providerPoolManager.markProviderUnhealthyImmediately(
+                        toProvider,
+                        { uuid: actualUuid },
+                        error.message
+                    );
+                }
+
+                if (retryCount < MAX_RETRY_COUNT) {
+                    // 尝试获取新账户
+                    try {
+                        const { getApiServiceWithFallback } = await import('./service-manager.js');
+                        const result = await getApiServiceWithFallback(CONFIG, model);
+
+                        currentService = result.service;
+                        actualUuid = result.uuid;
+                        toProvider = result.actualProviderType;
+                        actualCustomName = result.serviceConfig?.customName;
+
+                        // 如果发生了模型级别的 fallback，需要更新请求使用的模型
+                        if (result.actualModel && result.actualModel !== model) {
+                            console.log(`[Retry] Model Fallback: ${model} -> ${result.actualModel}`);
+                            model = result.actualModel;
+                        }
+
+                        console.log(`[Retry] Switched to new account: ${actualUuid} (${toProvider})`);
+                        continue; // 继续重试
+                    } catch (selectError) {
+                        // 无法获取新账户，返回 503
+                        console.log(`[Retry] No healthy account available: ${selectError.message}`);
+                        const serviceUnavailableError = new Error('Service temporarily unavailable. All providers are exhausted.');
+                        serviceUnavailableError.statusCode = 503;
+                        await handleErrorResponse(res, serviceUnavailableError, fromProvider, isStream);
+                        return;
+                    }
+                }
+            } else {
+                // 其他错误（如 500 服务器错误），标记账号不健康但不重试
+                console.log(`[Retry] Other error type, marking unhealthy and returning: ${error.message}`);
+                if (providerPoolManager && actualUuid) {
+                    providerPoolManager.markProviderUnhealthy(toProvider, { uuid: actualUuid }, error.message);
+                }
+                await handleErrorResponse(res, error, fromProvider, isStream);
+                return;
+            }
+        }
     }
 
-    // 3. Apply system prompt from file if configured.
-    processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
-    await _manageSystemPrompt(processedRequestBody, toProvider);
-
-    // 4. Log the incoming prompt (after potential conversion to the backend's format).
-    const promptText = extractPromptText(processedRequestBody, toProvider);
-    await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
-    
-    // 5. Call the appropriate stream or unary handler, passing the provider info.
-    if (isStream) {
-        await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
-    } else {
-        await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName);
-    }
+    // 所有重试都失败，返回 503
+    console.log(`[Retry] All ${retryCount} retry attempts failed`);
+    const serviceUnavailableError = new Error('Service temporarily unavailable. All providers are exhausted.');
+    serviceUnavailableError.statusCode = 503;
+    await handleErrorResponse(res, serviceUnavailableError, fromProvider, isStream);
 }
 
 /**

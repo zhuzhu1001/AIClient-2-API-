@@ -263,6 +263,9 @@ export async function getApiService(config, requestedModel = null, options = {})
             throw new Error(errorMsg);
         }
     }
+    if (providerPoolManager) {
+        serviceConfig.providerPoolManager = providerPoolManager;
+    }
     return getServiceAdapter(serviceConfig);
 }
 
@@ -310,6 +313,10 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
         }
     }
     
+    if (providerPoolManager) {
+        serviceConfig.providerPoolManager = providerPoolManager;
+    }
+
     const service = getServiceAdapter(serviceConfig);
     
     return {

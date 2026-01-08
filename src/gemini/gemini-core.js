@@ -217,6 +217,10 @@ export class GeminiApiService {
         this.isInitialized = false;
 
         this.config = config;
+        this.providerPoolManager = config?.providerPoolManager || null;
+        this.providerType = config?.MODEL_PROVIDER || 'gemini-cli-oauth';
+        this.providerUuid = config?.uuid || null;
+        this.providerCustomName = config?.customName || null;
         this.host = config.HOST;
         this.oauthCredsBase64 = config.GEMINI_OAUTH_CREDS_BASE64;
         this.oauthCredsFilePath = config.GEMINI_OAUTH_CREDS_FILE_PATH;
@@ -403,7 +407,7 @@ export class GeminiApiService {
             return discoveredProjectId;
         } catch (error) {
             console.error('[Gemini] Failed to discover Project ID:', error.response?.data || error.message);
-            throw new Error('Could not discover a valid Google Cloud Project ID.');
+            this._handleProjectDiscoveryFailure(error);
         }
     }
 
@@ -479,6 +483,20 @@ export class GeminiApiService {
 
             throw error;
         }
+    }
+
+    _handleProjectDiscoveryFailure(error) {
+        if (this.providerPoolManager && this.providerUuid) {
+            const providerConfig = { uuid: this.providerUuid };
+            this.providerPoolManager.markProviderUnhealthy(this.providerType, providerConfig, error.message);
+            if (typeof this.providerPoolManager.disableProvider === 'function') {
+                this.providerPoolManager.disableProvider(this.providerType, providerConfig);
+                console.warn(`[Gemini] Provider disabled due to project discovery failure: ${this.providerUuid}${this.providerCustomName ? ` (${this.providerCustomName})` : ''}`);
+            }
+        }
+        const err = new Error('负载过高，请稍后重试。');
+        err.code = 'ACCOUNT_SUSPENDED';
+        throw err;
     }
 
     async * streamApi(method, body, isRetry = false, retryCount = 0) {
