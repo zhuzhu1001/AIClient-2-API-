@@ -164,7 +164,7 @@ export class ProviderPoolManager {
 
         const selected = availableAndHealthyProviders[currentIndex];
         this._log('debug', `Round Robin: providerType=${providerType}, index=${currentIndex}/${availableAndHealthyProviders.length}, selected=${selected.config.uuid}`);
-        
+
         // 更新使用信息（除非明确跳过）
         if (!options.skipUsageCount) {
             selected.config.lastUsed = new Date().toISOString();
@@ -404,7 +404,7 @@ export class ProviderPoolManager {
             provider.config.lastErrorTime = new Date().toISOString();
             // 更新 lastUsed 时间，避免因 LRU 策略导致失败节点被重复选中
             provider.config.lastUsed = new Date().toISOString();
-            
+
             // 保存错误信息
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
@@ -416,7 +416,36 @@ export class ProviderPoolManager {
             } else {
                 this._log('warn', `Provider ${providerConfig.uuid} for type ${providerType} error count: ${provider.config.errorCount}/${this.maxErrorCount}. Still healthy.`);
             }
-            
+
+            this._debouncedSave(providerType);
+        }
+    }
+
+    /**
+     * 立即标记提供商为不健康（不等待 errorCount 达到阈值）
+     * 用于额度耗尽、429 等需要立即切换的场景
+     * @param {string} providerType - The type of the provider.
+     * @param {object} providerConfig - The configuration of the provider to mark.
+     * @param {string} [errorMessage] - Optional error message to store.
+     */
+    markProviderUnhealthyImmediately(providerType, providerConfig, errorMessage = null) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in markProviderUnhealthyImmediately');
+            return;
+        }
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (provider) {
+            provider.config.isHealthy = false;
+            provider.config.errorCount = this.maxErrorCount; // 直接设为最大值
+            provider.config.lastErrorTime = new Date().toISOString();
+            provider.config.lastUsed = new Date().toISOString();
+
+            if (errorMessage) {
+                provider.config.lastErrorMessage = errorMessage;
+            }
+
+            this._log('warn', `Immediately marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Reason: ${errorMessage || 'capacity exhausted'}`);
             this._debouncedSave(providerType);
         }
     }
