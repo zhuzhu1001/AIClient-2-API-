@@ -26,6 +26,7 @@
     "supertest": "^6.3.3"
   },
   "scripts": {
+    "docker:build": "docker buildx build --platform linux/amd64 -t zstring/aiclient2api:latest --push .",
     "start": "node src/master.js",
     "start:standalone": "node src/api-server.js",
     "start:dev": "node src/master.js --dev",
